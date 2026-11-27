@@ -160,6 +160,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
                 crate::hle::d3d12x::vram::census_tick();
+                commit_census_tick();
                 let mb = |b: u64| b >> 20;
                 // (at the end: tools read the line's beginning; the guard script reads the budget)
                 let mut budget_text = if budget != 0 { format!("; video memory budget {} MB", mb(budget)) } else { String::new() };
@@ -284,4 +285,64 @@ mod tests {
         let (commit, limit) = system_commit();
         assert!(commit > 0 && commit <= limit, "{commit} of {limit}");
     }
+}
+
+/// LOCAL DIAGNOSTIC `XCL_COMMIT_CENSUS=1`: every 60 s, the process's committed memory by kind
+/// (private / mapped / image), how much of the private part lies in the UMA aperture (title
+/// memory XCL placed there: windows, views) or elsewhere, and the largest committed private
+/// allocations outside it with their sizes.
+fn commit_census_tick() {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("XCL_COMMIT_CENSUS").is_ok_and(|v| v.trim() == "1")) {
+        return;
+    }
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    {
+        let mut l = LAST.lock().unwrap();
+        if l.is_some_and(|t| t.elapsed().as_secs() < 60) {
+            return;
+        }
+        *l = Some(std::time::Instant::now());
+    }
+    let (ap_lo, ap_hi) = crate::gpu::uma::get().map_or((0, 0), |u| (u.base(), u.base() + 16 * crate::gpu::uma::WINDOW));
+    let (mut private, mut mapped, mut image, mut in_ap) = (0usize, 0usize, 0usize, 0usize);
+    // allocation base -> committed private bytes outside the aperture
+    let mut by_alloc: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut a = 0usize;
+    let t0 = std::time::Instant::now();
+    loop {
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(a as *const _, &mut m, std::mem::size_of_val(&m)) } == 0 {
+            break;
+        }
+        let (base, size) = (m.BaseAddress as usize, m.RegionSize);
+        if m.State == MEM_COMMIT {
+            match m.Type {
+                MEM_PRIVATE => {
+                    private += size;
+                    if base >= ap_lo && base < ap_hi {
+                        in_ap += size;
+                    } else {
+                        *by_alloc.entry(m.AllocationBase as usize).or_default() += size;
+                    }
+                }
+                MEM_MAPPED => mapped += size,
+                MEM_IMAGE => image += size,
+                _ => {}
+            }
+        }
+        match base.checked_add(size) {
+            Some(n) if n > a => a = n,
+            _ => break,
+        }
+    }
+    let mut top: Vec<(usize, usize)> = by_alloc.into_iter().collect();
+    top.sort_by(|x, y| y.1.cmp(&x.1));
+    let small: usize = top.iter().filter(|t| t.1 < 64 << 20).map(|t| t.1).sum();
+    let big: Vec<String> = top.iter().take(12).map(|(b, n)| format!("{b:#x}:{}MB", n >> 20)).collect();
+    crate::xlog_info!(
+        "commit census ({} ms): private {} MB ({} MB in the UMA aperture, {} MB in allocations under 64 MB outside it), mapped {} MB, image {} MB; largest outside the aperture: {}",
+        t0.elapsed().as_millis(), private >> 20, in_ap >> 20, small >> 20, mapped >> 20, image >> 20, big.join(" ")
+    );
 }
