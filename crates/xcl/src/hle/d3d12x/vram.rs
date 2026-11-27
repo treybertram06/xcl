@@ -161,6 +161,9 @@ unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -
         crate::xlog_warn!("D3D12.X: video-memory arena for {va:#x}: CreateHeap: {e}");
         return None;
     }
+    if let Some(h) = &heap {
+        super::residency::set(dev, h, super::residency::Class::Arena);
+    }
     let made = MADE_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -318,6 +321,198 @@ impl Levels {
     /// Its tiles that have pages.
     fn mapped_tiles(&self) -> u64 {
         self.groups.iter().filter(|g| g.3).map(|g| g.2 as u64).sum()
+    }
+
+    /// The groups with pages whose title pages are all `gone` (tile i on page `first + i * PAGE`
+    /// for the `own` tiles of the texture's own pages): a group with no tile on its own pages
+    /// is never one (nothing tells whether the title still has memory behind it).
+    fn streamed_out(&self, first: usize, own: usize, gone: impl Fn(usize) -> bool) -> Vec<usize> {
+        self.groups.iter().enumerate().filter(|(_, g)| g.3).filter_map(|(k, &(_, t0, n, _))| {
+            let (start, end) = (t0 as usize, ((t0 + n) as usize).min(own));
+            (start < end && (start..end).all(|i| gone(first + i * PAGE))).then_some(k)
+        }).collect()
+    }
+}
+
+/// `XCL_RELEASE_STREAMED_LEVELS=0` (on by default with `level_pages`): a lazy level keeps its
+/// pages when the title unmaps the memory under it.
+fn release_streamed_levels() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    level_pages() && *ON.get_or_init(|| std::env::var("XCL_RELEASE_STREAMED_LEVELS").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Level groups and tiles given back by `release_streamed_out_levels` so far.
+static STREAMED_OUT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether the title has no memory behind its page `p` any more: every GPU-view page at it (`p`
+/// itself in a GPU view, else the GPU views of the CPU view it is in) shows nothing – the
+/// page-mapping method unmapped it. A page outside any view is never gone.
+fn title_page_gone(p: usize) -> bool {
+    use crate::hle::kernelx::mirrors;
+    let views = if mirrors::source(p).is_some() { vec![p] } else { mirrors::gpu_views_of(p) };
+    !views.is_empty() && views.iter().all(|&v| mirrors::shows(v) == mirrors::Shows::Nothing)
+}
+
+/// Bytes of the title's committed resources in video memory made so far: [buffers, textures].
+static COMMITTED: [std::sync::atomic::AtomicUsize; 2] = [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+
+pub(super) fn note_committed(bytes: usize, buffer: bool) {
+    COMMITTED[!buffer as usize].fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `XCL_VRAM_CENSUS=1` (LOCAL DIAGNOSTIC): every 20 s, the shared pages by what the title has at
+/// their address – a GPU-view page mapped / unmapped / never named, or memory outside the views –
+/// and by whether a lazy-level texture or another target holds them.
+pub fn census_tick() {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("XCL_VRAM_CENSUS").is_ok_and(|v| v.trim() == "1")) {
+        return;
+    }
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut l = LAST.lock().unwrap();
+        if l.is_some_and(|t| t.elapsed().as_secs() < 20) {
+            return;
+        }
+        *l = Some(std::time::Instant::now());
+    }
+    use crate::hle::kernelx::mirrors;
+    // (address, held by a lazy-level texture) of every page in use, and pool pages
+    let (mut held, extra): (Vec<(usize, bool)>, usize) = {
+        let g = PAGES.lock().unwrap();
+        let mut lazy = HashSet::new();
+        let mut v = Vec::new();
+        let mut extra = 0;
+        for p in g.values().flatten() {
+            for t in p.targets.values() {
+                if t.levels.is_some() {
+                    lazy.extend(t.used.iter().copied());
+                }
+            }
+            v.extend(p.pages.iter().filter(|(_, pg)| pg.users > 0).map(|(&a, _)| (a, lazy.contains(&a))));
+            extra += p.extra_pages.values().filter(|pg| pg.users > 0).count();
+        }
+        (v, extra)
+    };
+    held.sort_unstable();
+    // [lazy, other] x [view mapped, view unmapped, view never named, outside the views]
+    let mut n = [[0u64; 4]; 2];
+    for (a, lazy) in held {
+        let views = if mirrors::source(a).is_some() { vec![a] } else { mirrors::gpu_views_of(a) };
+        let k = match views.first().map(|&v| mirrors::shows(v)) {
+            None | Some(mirrors::Shows::NoView) => 3,
+            Some(mirrors::Shows::Page { .. }) => 0,
+            Some(mirrors::Shows::Nothing) => 1,
+            Some(mirrors::Shows::Same(_)) => 2,
+        };
+        n[!lazy as usize][k] += 1;
+    }
+    let mb = |x: u64| x * PAGE as u64 >> 20;
+    crate::xlog_info!(
+        "D3D12.X: VRAM census: lazy-level textures {} MB (view mapped {}, view unmapped {}, view never named {}, outside views {}); other targets {} MB (view mapped {}, view unmapped {}, view never named {}, outside views {}); extra tiles {} MB",
+        mb(n[0].iter().sum()), mb(n[0][0]), mb(n[0][1]), mb(n[0][2]), mb(n[0][3]),
+        mb(n[1].iter().sum()), mb(n[1][0]), mb(n[1][1]), mb(n[1][2]), mb(n[1][3]),
+        mb(extra as u64)
+    );
+    crate::xlog_info!(
+        "D3D12.X: VRAM census: title committed resources made {} MB (buffers {} MB, textures {} MB); sparse system-memory pools {} MB",
+        (COMMITTED[0].load(std::sync::atomic::Ordering::Relaxed) + COMMITTED[1].load(std::sync::atomic::Ordering::Relaxed)) >> 20,
+        COMMITTED[0].load(std::sync::atomic::Ordering::Relaxed) >> 20,
+        COMMITTED[1].load(std::sync::atomic::Ordering::Relaxed) >> 20,
+        super::sparse::sys_pool_bytes() >> 20
+    );
+}
+
+/// The title's page mappings changed at the GPU-view pages `changed`: the levels of lazy-level
+/// textures (`level_pages`) over them whose title pages are all unmapped now give their pages
+/// back (the texture streaming let them go; on the console nothing is behind them either, and
+/// the title samples them no more). A level gets pages again with its next texels, as at first
+/// (`map_levels`) – a mapping changed under a texture reads it again (`title_textures`).
+/// Without this every texture a title streams and abandons kept its video memory: the retail
+/// title placed 132 506 textures in 700 s and released 64.
+pub(super) unsafe fn release_streamed_out_levels(changed: &[usize]) {
+    if changed.is_empty() || !release_streamed_levels() {
+        return;
+    }
+    // (the record of views first: kernelx's locks are not taken under `PAGES`)
+    let mut keys: Vec<usize> = changed.iter().flat_map(|&g| [Some(g), crate::hle::kernelx::mirrors::source(g)]).flatten().map(|a| a & !(PAGE - 1)).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    // (device, texture, its first own page, own pages, its levels then)
+    let mut candidates: Vec<(usize, usize, usize, usize, Levels)> = Vec::new();
+    {
+        let g = PAGES.lock().unwrap();
+        for (&dev_key, pages) in g.iter() {
+            let Some(pages) = pages.as_ref() else { continue };
+            let mut seen = HashSet::new();
+            for &k in &keys {
+                for (_, resources) in pages.by_va.range(k.saturating_sub(pages.max_span)..=k) {
+                    for &r in resources {
+                        if !seen.insert(r) { continue }
+                        let Some(t) = pages.targets.get(&r) else { continue };
+                        let Some(l) = t.levels.as_ref().filter(|l| t.mapped && l.groups.iter().any(|g| g.3)) else { continue };
+                        let Some((first, own)) = owned_pages(t.va, t.console_bytes, t.total as usize) else { continue };
+                        if k >= first && k < first + own * PAGE {
+                            candidates.push((dev_key, r, first, own, l.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let gone: Vec<(usize, usize, Vec<usize>)> = candidates.into_iter().filter_map(|(dev_key, r, first, own, l)| {
+        let ks = l.streamed_out(first, own, title_page_gone);
+        (!ks.is_empty()).then_some((dev_key, r, ks))
+    }).collect();
+    if gone.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut g = PAGES.lock().unwrap();
+    for (dev_key, r, ks) in gone {
+        let Some(Some(pages)) = g.get_mut(&dev_key) else { continue };
+        let Some(t) = pages.targets.get_mut(&r) else { continue };
+        if !t.mapped { continue }
+        let Some((first, own)) = owned_pages(t.va, t.console_bytes, t.total as usize) else { continue };
+        let va = t.va;
+        let mut unmap: Vec<(u32, u32)> = Vec::new();
+        let (mut used, mut used_extra) = (Vec::new(), Vec::new());
+        let Some(l) = t.levels.as_mut() else { continue };
+        for k in ks {
+            let Some(&(sub, t0, n, true)) = l.groups.get(k) else { continue };
+            l.groups[k].3 = false;
+            unmap.push((sub, n));
+            for i in t0 as usize..(t0 + n) as usize {
+                if i < own { used.push(first + i * PAGE) } else { used_extra.push((va, i)) }
+            }
+        }
+        // (one of each from the texture's own lists: the pages it holds)
+        let take = |list: &mut Vec<usize>, want: &[usize]| want.iter().filter_map(|w| list.iter().position(|a| a == w).map(|i| list.swap_remove(i))).collect::<Vec<_>>();
+        let used = take(&mut t.used, &used);
+        let used_extra = {
+            let mut out = Vec::new();
+            for w in &used_extra {
+                if let Some(i) = t.used_extra.iter().position(|e| e == w) { out.push(t.used_extra.swap_remove(i)) }
+            }
+            out
+        };
+        let d = r as *mut c_void;
+        let Some(res) = ID3D12Resource::from_raw_borrowed(&d) else { continue };
+        let tiles: u32 = unmap.iter().map(|u| u.1).sum();
+        for (sub, n) in unmap {
+            pages.unmap_tiles(res, sub, n);
+        }
+        pages.release_tiles(used, used_extra, now, false);
+        LEVEL_STATS[2].fetch_sub(tiles as u64, std::sync::atomic::Ordering::Relaxed);
+        STREAMED_OUT[1].fetch_add(tiles as u64, std::sync::atomic::Ordering::Relaxed);
+        let groups = STREAMED_OUT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if groups >= 256 && groups.is_power_of_two() {
+            let (textures, stand, mapped, _) = level_stats();
+            crate::xlog_info!(
+                "D3D12.X: level pages: {groups} levels gave back {} MB of pages the title unmapped under them; {textures} textures standing for {} MB have pages for {} MB",
+                STREAMED_OUT[1].load(std::sync::atomic::Ordering::Relaxed) >> 4, stand >> 4, mapped >> 4
+            );
+        }
     }
 }
 
@@ -517,6 +712,44 @@ impl TilePool {
     }
 }
 
+/// LOCAL PROTOTYPE (placement v0), `XCL_TEXTURE_SYSMEM=1`: the levels of lazy-level textures
+/// (`level_pages`) get their pages from pool heaps in system memory (custom heaps in L0, sampled
+/// over PCIe); render targets keep video memory. A page of those heaps has `SYS_TILE` in its heap
+/// index.
+const SYS_TILE: u32 = 1 << 31;
+
+fn texture_sysmem() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = level_pages() && std::env::var("XCL_TEXTURE_SYSMEM").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("D3D12.X: XCL_TEXTURE_SYSMEM=1 - the levels of streamed textures in system memory");
+        }
+        on
+    })
+}
+
+/// One 64 MiB system-memory heap for the pages of streamed texture levels (`texture_sysmem`).
+unsafe fn alloc_sys_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
+    let desc = D3D12_HEAP_DESC {
+        SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
+        Properties: D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: super::residency::sys_page_property(),
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        },
+        Alignment: 0,
+        Flags: D3D12_HEAP_FLAG_NONE,
+    };
+    let mut heap: Option<ID3D12Heap> = None;
+    if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
+        crate::xlog_warn!("D3D12.X: no system-memory pool heap for texture levels ({e})");
+        return None;
+    }
+    heap
+}
+
 /// Allocate one 64 MiB default heap for `Pages`.
 unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
     let desc = D3D12_HEAP_DESC {
@@ -530,6 +763,9 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
     if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
         crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
         return None;
+    }
+    if let Some(h) = &heap {
+        super::residency::set(dev, h, super::residency::Class::Pages);
     }
     heap
 }
@@ -605,6 +841,9 @@ struct Pages {
     /// pool heaps by `Tile` index (a reclaimed one's slot is empty, as `TilePool::live` has it)
     pools: PoolHeaps,
     pool: TilePool,
+    /// the system-memory pools of streamed texture levels (`texture_sysmem`; indices without `SYS_TILE`)
+    sys_pools: PoolHeaps,
+    sys_pool: TilePool,
     /// title page address → its video memory
     pages: std::collections::HashMap<usize, Page>,
     /// extra / sub-64 KiB tiles keyed by `(va, tile_index)` so repeated placements at the same
@@ -614,6 +853,10 @@ struct Pages {
     idle: std::collections::VecDeque<(PageKey, std::time::Instant)>,
     /// resource → its mapping metadata and currently held pages / extra keys
     targets: std::collections::HashMap<usize, Target>,
+    /// address → the textures with lazy levels placed there (`release_streamed_out_levels`)
+    by_va: std::collections::BTreeMap<usize, Vec<usize>>,
+    /// the most bytes of own pages one of them covers
+    max_span: usize,
     /// queue → the fence value it last waited for
     waited: std::collections::HashMap<usize, u64>,
     /// cached `reservable()` answers for `(DXGI_FORMAT, SampleCount)` on this device
@@ -651,10 +894,14 @@ impl Pages {
             last_reclaim: std::time::Instant::now(),
             pools: PoolHeaps::new(),
             pool: TilePool::new(),
+            sys_pools: PoolHeaps::new(),
+            sys_pool: TilePool::new(),
             pages: std::collections::HashMap::new(),
             extra_pages: std::collections::HashMap::new(),
             idle: std::collections::VecDeque::new(),
             targets: std::collections::HashMap::new(),
+            by_va: std::collections::BTreeMap::new(),
+            max_span: 0,
             waited: std::collections::HashMap::new(),
             reservable_cache: std::collections::HashMap::new(),
             scratch_heaps: Vec::new(),
@@ -666,7 +913,11 @@ impl Pages {
 
     /// Pages no resource used for `IDLE` go back to the pools.
     fn sweep(&mut self, now: std::time::Instant) {
-        sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut self.pool.cooling, now);
+        let mut cooled = std::collections::VecDeque::new();
+        sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut cooled, now);
+        for (t, at) in cooled {
+            self.cool(t, at);
+        }
     }
 
     /// Sweep expired idle pages, drain cooled tiles, and reclaim any completely empty 64 MiB
@@ -675,6 +926,7 @@ impl Pages {
     fn sweep_and_reclaim(&mut self, now: std::time::Instant) -> Vec<ID3D12Heap> {
         self.sweep(now);
         self.pool.drain_cooling(now);
+        self.sys_pool.drain_cooling(now);
         let reclaimed_ids = self.pool.reclaim_empty_heaps(keep_spare_pools(), POOL_PAGES);
         let mut dropped = Vec::with_capacity(reclaimed_ids.len());
         for idx in reclaimed_ids {
@@ -706,7 +958,8 @@ impl Pages {
         for i in 0..self.scratch_heaps.len() {
             let h = self.scratch_heaps[i];
             // (a tile is only ever of a heap the pool has: `TilePool::reclaim_empty_heaps`)
-            let Some(heap) = self.pools.get(h as usize) else { continue };
+            let heap = if h & SYS_TILE != 0 { self.sys_pools.get((h & !SYS_TILE) as usize) } else { self.pools.get(h as usize) };
+            let Some(heap) = heap else { continue };
             let ranges = heap_ranges_trimmed(h, tiles);
             if ranges.is_empty() {
                 continue;
@@ -771,6 +1024,29 @@ impl Pages {
         let _ = self.queue.Signal(&self.fence, self.value);
     }
 
+    /// Unmap the `n` tiles of `res` from the first one of subresource `sub` on (as `map` maps
+    /// them): a level group of a lazy-level texture.
+    unsafe fn unmap_tiles(&mut self, res: &ID3D12Resource, sub: u32, n: u32) {
+        if n == 0 {
+            return;
+        }
+        let coord = D3D12_TILED_RESOURCE_COORDINATE { Subresource: sub, ..Default::default() };
+        let region = D3D12_TILE_REGION_SIZE { NumTiles: n, UseBox: false.into(), ..Default::default() };
+        let flag = D3D12_TILE_RANGE_FLAG_NULL;
+        self.queue.UpdateTileMappings(res, 1, Some(&coord), Some(&region), None, 1, Some(&flag), None, Some(&n), D3D12_TILE_MAPPING_FLAG_NONE);
+        self.value += 1;
+        let _ = self.queue.Signal(&self.fence, self.value);
+    }
+
+    /// A page's tile freed: it cools in its own pools.
+    fn cool(&mut self, tile: Tile, at: std::time::Instant) {
+        if tile.0 & SYS_TILE != 0 {
+            self.sys_pool.push_cooling((tile.0 & !SYS_TILE, tile.1), at);
+        } else {
+            self.pool.push_cooling(tile, at);
+        }
+    }
+
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
         for a in used {
             if let Some(p) = self.pages.get_mut(&a) {
@@ -778,7 +1054,7 @@ impl Pages {
                 if p.users == 0 {
                     if immediate_cool {
                         if let Some(p) = self.pages.remove(&a) {
-                            self.pool.push_cooling(p.tile, now);
+                            self.cool(p.tile, now);
                         }
                     } else {
                         p.idle_since = Some(now);
@@ -793,7 +1069,7 @@ impl Pages {
                 if p.users == 0 {
                     if immediate_cool {
                         if let Some(p) = self.extra_pages.remove(&k) {
-                            self.pool.push_cooling(p.tile, now);
+                            self.cool(p.tile, now);
                         }
                     } else {
                         p.idle_since = Some(now);
@@ -812,6 +1088,12 @@ impl Pages {
     /// `bind` for the tiles `range` of the resource's `total`, which start at subresource `sub`.
     #[allow(clippy::too_many_arguments)]
     unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+        self.bind_range_in(dev, res, va, console_bytes, total, sub, range, false)
+    }
+
+    /// `bind_range`, its new pages from the system-memory pools with `sys` (`texture_sysmem`).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bind_range_in(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>, sys: bool) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
@@ -825,18 +1107,25 @@ impl Pages {
                 self.extra_pages.get(&(va, i)).map(|p| p.tile.0)
             };
             match existing {
-                Some(h) if preferred.is_none() => preferred = Some(h),
+                Some(h) if preferred.is_none() && (h & SYS_TILE != 0) == sys => preferred = Some(h & !SYS_TILE),
                 Some(_) => {}
                 None => missing += 1,
             }
         }
 
+        let fresh = if sys {
+            let pools = &mut self.sys_pools;
+            self.sys_pool.take_batch(missing, preferred, now, POOL_PAGES, || {
+                let heap = alloc_sys_pool_heap(dev)?;
+                Some(pools.push_heap(heap))
+            }).map(|v| v.into_iter().map(|(h, t)| (h | SYS_TILE, t)).collect::<Vec<_>>())
+        } else { None };
         let pools = &mut self.pools;
         let pool = &mut self.pool;
-        let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
+        let fresh = if let Some(f) = fresh { Some(f) } else { pool.take_batch(missing, preferred.filter(|_| !sys), now, POOL_PAGES, || {
             let heap = alloc_pool_heap(dev)?;
             Some(pools.push_heap(heap))
-        })?;
+        }) }?;
         let mut fresh_iter = fresh.into_iter();
 
         let mut tiles = Vec::with_capacity(range.len());
@@ -1034,6 +1323,10 @@ unsafe fn place_on_pages(
                 // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
+                if let Some((first, own)) = owned_pages(va, console_bytes, total as usize) {
+                    pages.by_va.entry(first).or_default().push(raw as usize);
+                    pages.max_span = pages.max_span.max(own * PAGE);
+                }
                 pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels });
                 true
             } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
@@ -1135,6 +1428,14 @@ fn forget_pages(resource: usize) {
     let now = std::time::Instant::now();
     for pages in g.values_mut().flatten() {
         let Some(t) = pages.targets.remove(&resource) else { continue };
+        if let Some(first) = t.levels.as_ref().and_then(|_| owned_pages(t.va, t.console_bytes, t.total as usize)).map(|o| o.0) {
+            if let std::collections::btree_map::Entry::Occupied(mut e) = pages.by_va.entry(first) {
+                e.get_mut().retain(|&r| r != resource);
+                if e.get().is_empty() {
+                    e.remove();
+                }
+            }
+        }
         if let Some(l) = &t.levels {
             LEVEL_STATS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             LEVEL_STATS[1].fetch_sub(t.total as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1413,7 +1714,7 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return Vec::new() };
         let mut fresh = Vec::new();
         for (k, sub, first, n, levels) in todo {
-            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize) else { continue };
+            let Some((used, used_extra)) = pages.bind_range_in(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize, texture_sysmem()) else { continue };
             let Some(t) = pages.targets.get_mut(&key) else { return fresh };
             t.used.extend(used);
             t.used_extra.extend(used_extra);
@@ -1674,6 +1975,27 @@ mod tests {
         assert_eq!(Levels::new(&[(0, 4), (4, 1)], None, 6, 2), None);
         assert_eq!(Levels::new(&[(0, 4), (4, 0)], None, 4, 2), None);
         assert_eq!(Levels::new(&[], None, 0, 1), None);
+    }
+
+    #[test]
+    fn levels_whose_title_pages_are_all_unmapped_are_streamed_out() {
+        // 2048x2048 BC7: 64, 16, 4, 1 tiles and 1 for the packed levels, on pages from 0x1000_0000
+        let mut l = Levels::new(&[(0, 64), (64, 16), (80, 4), (84, 1)], Some((85, 1)), 86, 12).unwrap();
+        let first = 0x1000_0000usize;
+        let page = |i: usize| first + i * PAGE;
+        // the title unmapped the memory under the top two levels and half of the third
+        let gone = |p: usize| p < page(82);
+        // nothing has pages yet: nothing to give back
+        assert!(l.streamed_out(first, 86, gone).is_empty());
+        l.groups.iter_mut().for_each(|g| g.3 = true);
+        assert_eq!(l.streamed_out(first, 86, gone), vec![0, 1]);
+        // a level given back already is not again
+        l.groups[0].3 = false;
+        assert_eq!(l.streamed_out(first, 86, gone), vec![1]);
+        // tiles past the texture's own pages tell nothing: the packed group there never goes,
+        // a group partly there goes on what its own pages say
+        assert_eq!(l.streamed_out(first, 82, |_| true), vec![1, 2]);
+        assert!(l.streamed_out(first, 86, |_| false).is_empty());
     }
 
     #[test]

@@ -371,6 +371,51 @@ fn zero_runs(pieces: BTreeSet<(usize, usize)>) -> Vec<(usize, usize)> {
     out
 }
 
+/// LOCAL PROTOTYPE (placement v0), `XCL_SPARSE_SYSMEM=1`: sparse-window tiles outside the
+/// title's GPU heaps (`note_hot`) get pool tiles in system memory (custom heaps in L0, read by
+/// the GPU over PCIe) instead of video memory; the GPU heaps' tiles keep video memory. A pool
+/// tile of these heaps has `SYS` set in its pool index.
+const SYS: u32 = 1 << 31;
+
+#[derive(Default)]
+struct SysPools {
+    heaps: Vec<ID3D12Heap>,
+    free: Vec<(u32, u32)>,
+    cooling: VecDeque<((u32, u32), std::time::Instant)>,
+}
+
+// D3D12 heaps are free-threaded
+unsafe impl Send for SysPools {}
+
+static SYS_POOLS: Mutex<Option<SysPools>> = Mutex::new(None);
+/// the title's GPU heaps in the sparse windows (`XCL_COHERENT_HEAPS=sparse`): (start, bytes)
+static HOT: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// `[a, a + n)` is a GPU heap of the title: its tiles keep video memory under `XCL_SPARSE_SYSMEM`.
+pub fn note_hot(a: usize, n: usize) {
+    HOT.lock().unwrap().push((a, n));
+}
+
+fn sysmem_tiles() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_SPARSE_SYSMEM").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("sparse windows: XCL_SPARSE_SYSMEM=1 - tiles outside the title's GPU heaps in system memory");
+        }
+        on
+    })
+}
+
+fn is_hot(a: usize) -> bool {
+    HOT.lock().unwrap().iter().any(|&(s, n)| a >= s && a < s + n)
+}
+
+/// Bytes of the system-memory pool heaps.
+pub fn sys_pool_bytes() -> usize {
+    SYS_POOLS.lock().unwrap().as_ref().map_or(0, |p| p.heaps.len() * POOL_TILES as usize * TILE)
+}
+
 /// Whether the oldest tile of `cooling` was freed `COOL` ago or more at `now`
 fn cooled(cooling: &VecDeque<((u32, u32), std::time::Instant)>, now: std::time::Instant) -> bool {
     cooling.front().is_some_and(|&(_, at)| now.duration_since(at) >= COOL)
@@ -1219,6 +1264,62 @@ impl State {
         self.windows.iter().position(|(b, _)| a >= *b && a < *b + crate::gpu::uma::WINDOW)
     }
 
+    /// `take_tile` from the system-memory pools (`XCL_SPARSE_SYSMEM`).
+    unsafe fn take_sys_tile(&mut self) -> Option<((u32, u32), bool)> {
+        self.drain_quarantined();
+        let mut g = SYS_POOLS.lock().unwrap();
+        let p = g.get_or_insert_with(SysPools::default);
+        if let Some(t) = reuse_tile(&mut p.free, &mut p.cooling, std::time::Instant::now()) {
+            return Some((t, true));
+        }
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: POOL_TILES as u64 * TILE as u64,
+            Properties: D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: super::residency::sys_page_property(),
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        if let Err(e) = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)) {
+            crate::xlog_warn!("sparse windows: no system-memory pool heap ({e}) - video memory instead");
+            drop(g);
+            return self.take_tile();
+        }
+        let heap = heap?;
+        let _ = heap.SetName(windows::core::w!("xcl sparse system-memory pool"));
+        p.heaps.push(heap);
+        let h = SYS | (p.heaps.len() as u32 - 1);
+        p.free.extend((1..POOL_TILES).rev().map(|t| (h, t)));
+        let n = p.heaps.len();
+        if n.is_power_of_two() {
+            crate::xlog_info!("sparse windows: {} MB of system-memory pool heaps", n * POOL_TILES as usize * TILE >> 20);
+        }
+        Some(((h, 0), false))
+    }
+
+    /// The heap of pool index `h` (video memory, or a system-memory pool with `SYS`).
+    fn pool_heap(&self, h: u32) -> ID3D12Heap {
+        if h & SYS != 0 {
+            return SYS_POOLS.lock().unwrap().as_ref().expect("system-memory pools").heaps[(h & !SYS) as usize].clone();
+        }
+        self.pools[h as usize].clone().expect("a pool tile of a live pool")
+    }
+
+    /// A freed pool tile cools in its own pools' queue.
+    fn cool(&mut self, tile: (u32, u32), at: std::time::Instant) {
+        if tile.0 & SYS != 0 {
+            if let Some(p) = SYS_POOLS.lock().unwrap().as_mut() {
+                p.cooling.push_back((tile, at));
+            }
+        } else {
+            self.cooling.push_back((tile, at));
+        }
+    }
+
     /// A pool tile (true: used before, to be cleared). One freed less than `COOL` ago, or one
     /// still `quarantined`, is not taken: a retired pool is taken back or a heap made instead.
     /// (Parked tiles are not flushed for it: freed now, they would wait and cool all the same.)
@@ -1255,6 +1356,7 @@ impl State {
         }
         let heap = heap?;
         let _ = heap.SetName(windows::core::w!("xcl sparse tile pool"));
+        unsafe { super::residency::set(&self.dev, &heap, super::residency::Class::Sparse) };
         let h = self.add_pool(heap);
         Some(((h, 0), false))
     }
@@ -1340,7 +1442,7 @@ impl State {
                 coords.len() as u32,
                 Some(coords.as_ptr()),
                 Some(regions.as_ptr()),
-                self.pools[h as usize].as_ref().expect("a pool tile of a live pool"),
+                &self.pool_heap(h),
                 flags.len() as u32,
                 Some(flags.as_ptr()),
                 Some(offsets.as_ptr()),
@@ -1564,7 +1666,8 @@ impl State {
                     self.to_zero.insert((t, TILE));
                     unparked = true;
                 } else {
-                    let Some((tile, reused)) = self.take_tile() else { break };
+                    let got = if sysmem_tiles() && !is_hot(t) { self.take_sys_tile() } else { self.take_tile() };
+                    let Some((tile, reused)) = got else { break };
                     self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
                     early_add(&mut self.runs, t, t + TILE);
                     if reused {
@@ -2414,8 +2517,17 @@ fn uav_to_copy(r: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
 /// 4 GiB window boundary when `size <= 4 GiB`). Commits the CPU pages and maps VRAM tiles
 /// (or queues them until the D3D12 device exists). Returns `(address, rounded_size)`.
 pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
+    alloc_as(size, align, false)
+}
+
+/// `alloc` of a title GPU heap (`hot`: its tiles keep video memory under `XCL_SPARSE_SYSMEM`,
+/// known before its commit maps them).
+pub unsafe fn alloc_as(size: usize, align: usize, hot: bool) -> Option<(usize, usize)> {
     let u = crate::gpu::uma::get()?;
     let (addr, rounded) = u.sparse_alloc(size, align)?;
+    if hot {
+        note_hot(addr, rounded);
+    }
     if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
         u.sparse_release(addr);
         return None;
@@ -2980,7 +3092,7 @@ impl State {
             && self.parked.get(&t) != Some(&tile)
             && !self.quarantined.iter().any(|b| b.tiles.contains(&tile))
         {
-            self.cooling.push_back((tile, std::time::Instant::now()));
+            self.cool(tile, std::time::Instant::now());
         }
     }
 
@@ -3052,7 +3164,7 @@ impl State {
             let at = batch.at;
             for tile in batch.tiles {
                 if !self.pinned.contains_key(&tile) {
-                    self.cooling.push_back((tile, at));
+                    self.cool(tile, at);
                     freed = true;
                 }
             }

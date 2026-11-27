@@ -3255,6 +3255,20 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
         super::device_x::pc_initial_state_for_desc(orig_flags, pc_flags, state as u32)
     });
     let hr = dev_create_committed_resource(this, props, flags, desc, st as usize, clear, riid, ppv);
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        if let (Some(dev), Some(obj)) = (ID3D12Device::from_raw_borrowed(&this), windows::core::IUnknown::from_raw_borrowed(&*ppv)) {
+            super::residency::set(dev, obj, super::residency::Class::Committed);
+            // LOCAL DIAGNOSTIC (`XCL_VRAM_CENSUS`): video memory of the title's committed resources
+            let heap_type = if crate::gpu::shader::readable(props, 4) { *(props as *const i32) } else { 0 };
+            if heap_type == D3D12_HEAP_TYPE_DEFAULT.0 {
+                if let Ok(res) = obj.cast::<ID3D12Resource>() {
+                    let d = res.GetDesc();
+                    let info = dev.GetResourceAllocationInfo(0, &[d]);
+                    super::vram::note_committed(info.SizeInBytes as usize, d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
+                }
+            }
+        }
+    }
     if hr >= 0 && pc_full.is_some() && !ppv.is_null() && !(*ppv).is_null() {
         super::depth_uav::note_created(*ppv, &(console_desc as *const [u8; 0x38]).read_unaligned(), None, st);
         super::lut3d::created("CreateCommittedResource (a PC resource: not in the title's memory)", *ppv, Some(&(console_desc as *const [u8; 0x38]).read_unaligned()), None, false, st);
@@ -8857,6 +8871,17 @@ fn page_mapping_line(n: u64, t: crate::hle::kernelx::mirrors::Mapped, pool: usiz
 unsafe fn q_copy_page_mappings(count: u32, batches: usize, pool: usize, pool_pages: u32) -> HRESULT {
     match crate::hle::kernelx::mirrors::apply_batches(count, batches, pool, pool_pages) {
         Some(d) => {
+            // the GPU-view pages this call changed: texture levels the title unmapped give their
+            // video memory back (`vram::release_streamed_out_levels`)
+            {
+                static SEEN: Mutex<u64> = Mutex::new(0);
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                let (next, changed) = crate::hle::kernelx::mirrors::changes_since(*seen, 0, usize::MAX, usize::MAX);
+                *seen = next;
+                if d.unmapped > 0 {
+                    super::vram::release_streamed_out_levels(&changed.iter().map(|c| c.0).collect::<Vec<_>>());
+                }
+            }
             let mut t = PAGE_MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
             t.0 += 1;
             t.1.mapped += d.mapped;
