@@ -334,11 +334,12 @@ impl Levels {
     }
 }
 
-/// `XCL_RELEASE_STREAMED_LEVELS=0` (on by default with `level_pages`): a lazy level keeps its
-/// pages when the title unmaps the memory under it.
+/// `XCL_RELEASE_STREAMED_LEVELS=1` (off by default; with `level_pages`): a lazy level also gives
+/// its pages back when the title unmaps the memory under it (#2927 gives them back when an
+/// upload finds the level all zeros).
 fn release_streamed_levels() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    level_pages() && *ON.get_or_init(|| std::env::var("XCL_RELEASE_STREAMED_LEVELS").map_or(true, |v| v.trim() != "0"))
+    level_pages() && *ON.get_or_init(|| std::env::var("XCL_RELEASE_STREAMED_LEVELS").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Level groups and tiles given back by `release_streamed_out_levels` so far.
