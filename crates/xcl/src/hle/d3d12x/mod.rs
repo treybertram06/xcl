@@ -39,6 +39,7 @@ mod placements;
 pub mod present;
 pub mod pso_async;
 pub mod real;
+mod residency;
 mod scatter;
 mod shader_cache_session;
 mod sharded;

@@ -159,6 +159,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
+                crate::hle::d3d12x::vram::census_tick();
                 let mb = |b: u64| b >> 20;
                 // (at the end: tools read the line's beginning; the guard script reads the budget)
                 let mut budget_text = if budget != 0 { format!("; video memory budget {} MB", mb(budget)) } else { String::new() };

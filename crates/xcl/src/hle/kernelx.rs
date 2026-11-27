@@ -994,7 +994,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         // (#505). Costs a second copy in video memory and the write-watch scan of it.
         if sparse_heaps_min().is_some_and(|min| size >= min) {
             let rounded = size.max(1).div_ceil(align) * align;
-            if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc(rounded, align) {
+            if let Some((q, _)) = crate::hle::d3d12x::sparse::alloc_as(rounded, align, true) {
                 crate::xlog_info!("kernelx: a GPU heap of {} MB in the sparse windows (XCL_COHERENT_HEAPS)", size >> 20);
                 trace_mem("VirtualAlloc (graphics heap, sparse VRAM)", 0, rounded, t as u64, p, q);
                 // nothing of it in the coherent window, noted all the same: a run whose heaps all
