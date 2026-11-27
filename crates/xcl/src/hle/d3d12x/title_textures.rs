@@ -442,6 +442,15 @@ unsafe fn clone_resources(ptrs: &[usize]) -> Vec<ID3D12Resource> {
 static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
 // The dirty-page scan consumes write-watch state for every submission thread.
 // Keep the scan, pending-list update and GPU uploads together.
+/// LOCAL DIAGNOSTIC (`XCL_VRAM_CENSUS`): (active textures, their console bytes, shadowed ones,
+/// their bytes, ones waiting for their first upload)
+pub(super) fn census() -> (usize, u64, usize, u64, usize) {
+    let t = TEXTURES.lock().unwrap();
+    let a: u64 = t.by_res.values().map(|e| e.tex.size() as u64).sum();
+    let s: u64 = t.shadowed.values().map(|e| e.tex.size() as u64).sum();
+    (t.by_res.len(), a, t.shadowed.len(), s, t.pending_res.len())
+}
+
 static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

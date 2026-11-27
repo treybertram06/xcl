@@ -376,6 +376,11 @@ static SUPERSEDED: AtomicUsize = AtomicUsize::new(0);
 /// superseded ones used again] – tt: a target over a target, st: a sampled texture over a
 /// target, ...
 static COUNTS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+/// LOCAL DIAGNOSTIC (`XCL_VRAM_CENSUS`): (live placements, superseded ones the title holds)
+pub(super) fn census() -> (usize, usize) {
+    REGISTRY.lock().unwrap().as_ref().map_or((0, 0), |r| (r.live.len(), r.unmapped))
+}
+
 static LAST_LINE: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// The kinds' place in `COUNTS`' groups of four.

@@ -415,6 +415,15 @@ pub fn census_tick() {
         mb(n[1].iter().sum()), mb(n[1][0]), mb(n[1][1]), mb(n[1][2]), mb(n[1][3]),
         mb(extra as u64)
     );
+    {
+        let (n, bytes, sh, sh_bytes, pending) = super::title_textures::census();
+        let (cap, next, free, heaps) = super::console_heap::slot_census();
+        let (live, superseded) = super::placements::census();
+        crate::xlog_info!(
+            "D3D12.X: resource census: title textures {n} active ({} MB of console bytes), {sh} shadowed ({} MB), {pending} awaiting upload; placements {live} live, {superseded} superseded; shared view heap {next} of {cap} slots used ({free} in free ranges), {heaps} console view heaps",
+            bytes >> 20, sh_bytes >> 20
+        );
+    }
     crate::xlog_info!(
         "D3D12.X: VRAM census: title committed resources made {} MB (buffers {} MB, textures {} MB); sparse system-memory pools {} MB",
         (COMMITTED[0].load(std::sync::atomic::Ordering::Relaxed) + COMMITTED[1].load(std::sync::atomic::Ordering::Relaxed)) >> 20,

@@ -209,6 +209,14 @@ static NAMES: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
 /// Writes of descriptors into the shared heap and of what they name (`NAMES`), one at a time:
 /// a null view for a destroyed resource must not come over a view another thread just wrote.
 /// Taken before `GLOBAL` or `HEAPS`, never with them held.
+/// LOCAL DIAGNOSTIC (`XCL_VRAM_CENSUS`): the shared view heap's (capacity, high-water mark, slots in
+/// free ranges), and the console view heaps
+pub(super) fn slot_census() -> (u32, u32, u64, usize) {
+    let g = GLOBAL.lock().unwrap();
+    let (cap, next, free) = g.as_ref().map_or((0, 0, 0), |g| (g.cap, g.next, g.free.iter().map(|f| f.1 as u64).sum()));
+    (cap, next, free, HEAPS.lock().unwrap().len())
+}
+
 static SLOT_WRITES: Mutex<()> = Mutex::new(());
 
 fn names() -> &'static Names {
